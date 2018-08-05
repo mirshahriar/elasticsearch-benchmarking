@@ -4,6 +4,10 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"time"
+
+	"github.com/golang-collections/go-datastructures/queue"
+	elastic "gopkg.in/olivere/elastic.v5"
 )
 
 const (
@@ -77,7 +81,6 @@ func Populate() {
 			_, err := elasticClient.Index().
 				Index(index).
 				Type(docType).
-				Routing(fmt.Sprintf("%v", i%5)).
 				Id(fmt.Sprintf("%v", i)).
 				BodyJson(GenerateRandomData()).
 				Do(ctx)
@@ -88,15 +91,59 @@ func Populate() {
 	}
 }
 
-// SequentialUpdate ...
-func SequentialUpdate(id int, payload interface{}) error {
-	_, err := elasticClient.Update().
-		Index(index).
-		Type(docType).
-		Routing(fmt.Sprintf("%v", (id % 5))).
-		Id(fmt.Sprintf("%v", id)).
-		RetryOnConflict(2).
-		Doc(payload).
-		Do(ctx)
-	return err
+type lazyUpdateTuple struct {
+	id  string
+	doc *Data
+}
+
+var lazyDriverPatchQueue = new(queue.Queue)
+
+// BulkUpdate ...
+func BulkUpdate(id string, payload *Data) error {
+	lazyDriverPatchQueue.Put(
+		lazyUpdateTuple{id, payload},
+	)
+	return nil
+}
+
+// LazyPatchDrivers ...
+func LazyPatchDrivers() {
+	tick := time.Tick(time.Second * 1)
+
+	for {
+		select {
+		case <-tick:
+			queueLen := lazyDriverPatchQueue.Len()
+			if queueLen == 0 {
+				continue
+			}
+			driversToWrite, fetchError := lazyDriverPatchQueue.Get(queueLen)
+			if fetchError != nil {
+				fmt.Errorf("Bulk Writing Failed %v", fetchError)
+				continue
+			}
+
+			driverMap := make(map[string]interface{})
+			for _, singleDriverPatch := range driversToWrite {
+				driverMap[singleDriverPatch.(lazyUpdateTuple).id] = singleDriverPatch.(lazyUpdateTuple).doc
+			}
+			fmt.Println("Writing in bulk entries: driverMapLen=", len(driverMap), ", queueLen=", queueLen)
+
+			bulkRequest := elasticClient.Bulk()
+			for id, doc := range driverMap {
+				bulkRequest.Add(
+					elastic.NewBulkUpdateRequest().
+						Index(index).
+						Type(docType).
+						Id(id).
+						RetryOnConflict(2).
+						Doc(doc),
+				)
+			}
+			_, insertErr := bulkRequest.Do(ctx)
+			if insertErr != nil {
+				fmt.Errorf("bulk error: %v", insertErr)
+			}
+		}
+	}
 }

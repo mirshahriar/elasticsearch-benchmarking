@@ -51,7 +51,7 @@ func GenerateRandomData() *Data {
 	}
 }
 
-const size = 200
+const size = 50000
 
 // Populate ...
 func Populate() {
